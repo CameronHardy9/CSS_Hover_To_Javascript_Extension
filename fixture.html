@@ -1,0 +1,172 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>cssHoverToJS fixture</title>
+<style>
+  :root {
+    --brand-500: #3b6ef0;
+    --brand-600: #2b4fc0;
+    --lift: -2px;
+    --pad: 12px;
+  }
+  body { font: 16px/1.5 system-ui, sans-serif; margin: 24px; }
+  section { margin-bottom: 28px; padding: 12px; border: 1px solid #ddd; }
+
+  /* 1. descendant subject: hover the card, restyle the title */
+  .card { padding: var(--pad); background: #f6f7fb; }
+  .card .title { color: #333; transform: translateY(0); transition: none; }
+  .card:hover .title {
+    color: var(--brand-600);
+    transform: translateY(var(--lift));
+    font-weight: 700;
+  }
+  .card:hover .icon { opacity: 1; }
+  .card .icon { opacity: .3; }
+
+  /* 2. the target's own hover, layered on top of an ancestor's hover */
+  .card .title:hover { text-decoration: underline; letter-spacing: calc(1px + 0.01em); }
+
+  /* 3. sibling combinator */
+  .list li { background: #eee; }
+  .list li:hover + li { background: gold; }
+  .list li:hover ~ li em { font-style: normal; }
+
+  /* 4. pseudo-element */
+  .btn { position: relative; padding: 8px 14px; background: var(--brand-500); color: #fff; border: 0; }
+  .btn::after { content: ''; position: absolute; inset: 0; box-shadow: 0 0 0 0 rgba(0,0,0,.4); opacity: 0; }
+  .btn:hover::after { opacity: 1; box-shadow: 0 0 0 4px rgba(0,0,0,.4); }
+  .btn:hover { background: var(--brand-600); }
+
+  /* 5. media-query-wrapped hover */
+  @media (min-width: 300px) {
+    .card:hover .meta { color: crimson; }
+  }
+  @media (min-width: 99999px) {
+    .card:hover .meta { color: lime; }   /* must be ignored */
+  }
+
+  /* 6. specificity trap: the hover rule LOSES, so nothing should be emitted */
+  .trap:hover .word { color: red; }
+  #trapbox .word { color: green; }
+
+  /* 7. !important in the base state -> inline application must escalate */
+  .imp .label { color: black !important; }
+  .imp:hover .label { color: var(--brand-600); }
+
+  /* 8. :has(:hover) */
+  .haswrap:has(.hot:hover) { outline: 3px solid var(--brand-500); }
+
+  /* 9. cascade layers */
+  @layer base, theme;
+  @layer base { .layered:hover { background: #111; } }
+  @layer theme { .layered:hover { background: rebeccapurple; } }
+
+  /* 10. CSS nesting */
+  .nested {
+    color: #444;
+    &:hover { color: teal; > .child { font-size: 20px; } }
+  }
+
+  /* 11. shorthand collapsing */
+  .short:hover .box { margin-top: 4px; margin-right: 8px; margin-bottom: 4px; margin-left: 8px; }
+  .short .box { margin: 0; background: #eee; }
+
+  /* 12. big fan-out -> should escalate to stylesheet mode */
+  .fan:hover .cell { background: #cfd; }
+
+  /* 13. hover !important over a base !important -> inline must escalate */
+  .imp2 .label2 { color: black !important; }
+  .imp2:hover .label2 { color: var(--brand-600) !important; }
+
+  /* 14. a pre-existing style attribute must be restored, not clobbered */
+  .inl:hover .slot { color: teal; letter-spacing: 2px; }
+
+  /* 15. two elements hovered at once */
+  .multi:hover .kid:hover { background: orange; }
+
+  /* 16. inverted state: styles the NOT-hovered siblings */
+  .inv li:not(:hover) { opacity: .4; }
+
+  /* 17. transition + animation on the hover target */
+  .anim .bar { width: 40px; background: #999; transition: width .8s ease, background 1s linear; }
+  .anim:hover .bar { width: 200px; background: var(--brand-500); }
+
+  /* 18. hover sets a custom property; descendants inherit it via var() */
+  .tok { --local: #333; }
+  .tok .leaf { color: var(--local); }
+  .tok:hover { --local: var(--brand-600); }
+</style>
+</head>
+<body>
+
+<section>
+  <div class="card" id="card-3">
+    <a class="title" id="t" href="#">Card title</a>
+    <span class="icon">*</span>
+    <p class="meta">meta text</p>
+  </div>
+</section>
+
+<section>
+  <ul class="list">
+    <li id="li1">one</li>
+    <li id="li2">two <em>emph</em></li>
+    <li id="li3">three <em>emph</em></li>
+  </ul>
+</section>
+
+<section><button class="btn" id="btn">Press</button></section>
+
+<section id="trapbox"><div class="trap"><span class="word" id="word">trapped</span></div></section>
+
+<section class="imp"><span class="label" id="label">important</span></section>
+
+<section class="haswrap" id="haswrap"><span class="hot" id="hot">hot</span></section>
+
+<section><div class="layered" id="layered">layered</div></section>
+
+<section><div class="nested" id="nested">nested <span class="child" id="child">child</span></div></section>
+
+<section class="short"><div class="box" id="box">shorthand</div></section>
+
+<section class="fan" id="fan">
+  <i class="cell">1</i><i class="cell">2</i><i class="cell">3</i><i class="cell">4</i><i class="cell">5</i>
+  <i class="cell">6</i><i class="cell">7</i><i class="cell">8</i><i class="cell">9</i><i class="cell">10</i>
+</section>
+
+<section class="imp2"><span class="label2" id="label2">important both ways</span></section>
+
+<section class="inl"><span class="slot" id="slot" style="color: rebeccapurple">inline attr</span></section>
+
+<section class="multi" id="multi"><span class="kid" id="kid">both hovered</span></section>
+
+<section class="inv"><ul><li id="inv1">a</li><li id="inv2">b</li></ul></section>
+
+<section class="anim" id="anim"><div class="bar" id="bar">animated</div></section>
+
+<section class="tok" id="tok"><span class="leaf" id="leaf">token holder</span></section>
+
+<section><my-widget id="widget"></my-widget></section>
+
+<script>
+  // adoptedStyleSheets + open shadow DOM
+  const sheet = new CSSStyleSheet();
+  sheet.replaceSync(`
+    :host { display: block; }
+    .inner { color: #555; padding: 2px; }
+    .wrap:hover .inner { color: hotpink; padding: 6px; }
+    .inner::after { content: '!'; opacity: .2; }
+    .wrap:hover .inner::after { opacity: 1; font-weight: 700; }
+  `);
+  customElements.define('my-widget', class extends HTMLElement {
+    connectedCallback() {
+      const r = this.attachShadow({ mode: 'open' });
+      r.adoptedStyleSheets = [sheet];
+      r.innerHTML = '<div class="wrap"><span class="inner">shadow inner</span></div>';
+    }
+  });
+</script>
+<script src="./cssHoverToJavascript.js"></script>
+</body>
+</html>
