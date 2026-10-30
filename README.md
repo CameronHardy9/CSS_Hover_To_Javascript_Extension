@@ -142,3 +142,97 @@ swaps a custom property consumed by descendants.
   addressed by `:nth-of-type`, which breaks if DOM order changes.
 - **Element references are resolved when `applyHover()` runs**, so a re-render between
   generating the snippet and running it can leave it pointing at nothing.
+
+## Chrome extension
+
+The same analyzer, driven from a side panel instead of the console. `cssHoverToJavascript.js` is
+unchanged and unaware of the extension — the panel only ever calls its one public global,
+`window.cssHoverToJS(element, opts)` — so the file stays a standalone drop-in for other projects.
+
+### Install
+
+The repo root *is* the extension root. `chrome://extensions` → enable **Developer mode** →
+**Load unpacked** → select this directory. Then open a page and click the toolbar icon.
+
+```
+manifest.json              extension root
+cssHoverToJavascript.js    injected verbatim into the page
+extension/
+  background.js            service worker: injection + message routing
+  inject.js                the functions that run inside the page
+  picker.js                element picker overlay
+  sidepanel.{html,css,js}  the panel
+  icons/                   plus make-icons.mjs to regenerate them
+```
+
+The library is injected into the page's **main world** the moment the panel opens, so
+`cssHoverToJS($0)` also works in that page's own DevTools console — the console workflow above
+keeps working with nothing to paste.
+
+### Picking a target
+
+`cssHoverToJS` needs an element, so the panel needs a way to name one.
+
+**Pick element** highlights whatever is under the cursor and, on click, writes a selector into the
+input. The hovered node is `event.composedPath()[0]` — the node a real mouse actually hovers,
+including inside open shadow roots. Clicks, context menus and keyboard events are swallowed while
+picking, so nothing on the page activates; `Esc` cancels.
+
+The selector is built the same way the generated snippets build their own paths — id, then a
+test/name attribute, then classes plus `:nth-of-type` — and verified unique at every step. Shadow
+boundaries are written `host >>> inner`, one segment per boundary:
+
+```
+#nav > li:nth-of-type(3) > a
+my-widget#widget >>> span.inner
+```
+
+The input is editable and accepts anything `querySelector` does, so typing a selector by hand is
+equivalent to picking one. `Matches …` under the field resolves live; **Highlight** flashes a box
+over the match. When a selector matches several elements the first is analyzed, and the panel says
+so rather than refusing.
+
+### What it decides for you
+
+The panel is opinionated where the library is general. `verify`, `applyOnly`, `format` and `log` are
+not exposed, because the extension exists to hand someone a snippet they can trust, not to make them
+choose how it is generated:
+
+- **Every snippet is verified** against the real hover state, on every run. The panel says nothing
+  when it matches — a clean run is silent. It shows one red line, plus the full mismatch table,
+  when it does not.
+- **The snippet is always the apply-only form.** The panel's own button covers apply and clear, so
+  there is no reason to hand the user the `applyHover`/`clearHover` scaffolding too. It applies the
+  hover state and does not undo it, which is exactly what a screenshot needs; reload to reset.
+- **`format` is always `auto`**, which already escalates to an injected stylesheet exactly when
+  inline cannot work.
+- **The full report always goes to the page console**, on every run, inside a collapsed group. It
+  is not a setting, because turning it off would throw away the only complete account of what the
+  analysis found — see below.
+
+**Warnings live in that console report and nowhere else.** The single exception is CSS the analyzer
+could not read at all — an unreadable cross-origin stylesheet, or a closed shadow root — which
+raises a *"this snippet may be incomplete"* line in the panel. That one has to be visible, because
+always-on verify cannot catch it: the analyzer cannot read those rules, so it cannot rewrite them
+for the ground-truth snapshot either, and the comparison passes on an answer that is wrong.
+
+The single **Apply hover** button flips to **Clear hover** once the state is applied. It always
+runs the *toggle* snippet, not the apply-only one the user sees, because only the toggle form has a
+restore path. Analyzing again clears the hover first — reading the page with inline styles already
+applied would treat them as the base state. Nothing is truncated, either: `report()` caps at 25
+elements and 40 verify diffs, and the panel shows all of them.
+
+### Where it cannot help
+
+- **Pages whose CSP omits `unsafe-eval`.** Verification and the hover button both have to execute
+  the generated snippet, and `new Function` is refused on such a page — in the page's world by the page
+  CSP, and in the extension's isolated world by the extension's own MV3 CSP, which cannot be
+  relaxed. There is no world that escapes both. The panel probes for this when it opens, shows an
+  **eval blocked** badge, disables the hover button and skips verification rather than failing it.
+  Analysis, the report and the snippet all still work; paste the snippet into that page's DevTools
+  console, which is exempt.
+- **The top frame only.** Elements inside iframes are neither pickable nor analyzable.
+- **Restricted pages** — `chrome://`, the Web Store, other extensions — refuse injection entirely.
+- **Closed shadow roots** cannot be picked, the same way they cannot be analyzed.
+- **A `:nth-of-type` selector goes stale** if the DOM reorders between picking and analyzing. The
+  live `Matches …` count is the tell.

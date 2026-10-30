@@ -1,0 +1,29 @@
+{
+  "manifest_version": 3,
+  "name": "CSS Hover → JavaScript",
+  "version": "1.0.0",
+  "description": "Reconstruct any CSS :hover state as runnable JavaScript. Pick an element, get a snippet.",
+  "minimum_chrome_version": "116",
+  "permissions": ["scripting", "sidePanel", "tabs"],
+  "host_permissions": ["<all_urls>"],
+  "background": {
+    "service_worker": "extension/background.js",
+    "type": "module"
+  },
+  "side_panel": {
+    "default_path": "extension/sidepanel.html"
+  },
+  "action": {
+    "default_title": "CSS Hover → JavaScript",
+    "default_icon": {
+      "16": "extension/icons/icon16.png",
+      "48": "extension/icons/icon48.png",
+      "128": "extension/icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "extension/icons/icon16.png",
+    "48": "extension/icons/icon48.png",
+    "128": "extension/icons/icon128.png"
+  }
+}

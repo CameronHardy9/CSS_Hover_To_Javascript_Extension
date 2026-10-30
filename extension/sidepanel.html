@@ -1,0 +1,42 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CSS Hover → JavaScript</title>
+<link rel="stylesheet" href="sidepanel.css">
+
+<header>
+  <div class="brand">
+    <strong>CSS Hover → JS</strong>
+    <span class="url" id="page-url"></span>
+  </div>
+  <div class="meta">
+    <span class="badge" id="world" title="Library status on this page"></span>
+    <span class="ver" id="version"></span>
+    <button class="ghost icon" id="reinject" title="Re-inject the library">↻</button>
+  </div>
+</header>
+
+<div class="banner" id="banner" hidden></div>
+
+<main>
+  <section>
+    <h2>Target</h2>
+    <div class="row">
+      <button class="outline grow" id="pick">Pick element</button>
+      <button class="ghost" id="flash" title="Flash a box over the matched element">Highlight Selection</button>
+    </div>
+    <input id="selector" type="text" spellcheck="false" autocomplete="off"
+           placeholder="#id · .class > a · my-widget &gt;&gt;&gt; .inner">
+    <p class="hint" id="match">Pick an element, or type a selector.</p>
+  </section>
+
+  <button class="primary" id="analyze" disabled>Analyze</button>
+
+  <div id="results"></div>
+</main>
+
+<footer id="live" hidden>
+  <button class="outline grow" id="hover-toggle">Apply hover</button>
+</footer>
+
+<script type="module" src="sidepanel.js"></script>
