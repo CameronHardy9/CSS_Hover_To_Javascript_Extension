@@ -4,17 +4,22 @@
  * The panel never touches chrome.scripting itself -- it sends a message and gets a
  * plain object back.
  *
- * Everything runs in the page's MAIN world, so `window.cssHoverToJS` is also
+ * The library runs in the page's MAIN world, so `window.cssHoverToJS` is also
  * reachable from the page's own DevTools console, preserving the workflow the
- * README documents. There is deliberately no isolated-world fallback: measured on
- * Chrome 151, `new Function` is blocked in BOTH worlds on a page whose CSP omits
- * 'unsafe-eval' -- by the page CSP in MAIN, and by the extension's own MV3 CSP in
- * ISOLATED, which cannot be relaxed. Switching worlds buys nothing, so instead the
- * panel asks up front whether eval works here (`getCapabilities`) and disables the
- * two features that need it. Analysis and snippet generation need no eval and work
- * on every page.
+ * README documents. Nothing here evals: the hover button sends the result's
+ * `plan` (plain data) to the library's toggle(), so a page CSP without
+ * 'unsafe-eval' -- GitHub, MDN -- limits nothing.
+ *
+ * Two things page script cannot do are done here on its behalf before analysis:
+ *  - read cross-origin stylesheets: fetched with the extension's host permission
+ *    and handed to the library as text;
+ *  - tell a closed shadow root from an ordinary element: chrome.dom, which only
+ *    exists in the extension's ISOLATED world.
  */
-import { getCapabilities, runAnalysis, applySnippet, clearSnippet, probeSelector, flashSelector } from './inject.js';
+import {
+  getCapabilities, runAnalysis, applySnippet, clearSnippet, probeSelector, flashSelector,
+  unreadableSheets, provideSheets, closedShadowHosts,
+} from './inject.js';
 
 const LIBRARY = 'cssHoverToJavascript.js'; // at the extension root, injected verbatim
 const PICKER = 'extension/picker.js';
@@ -54,6 +59,63 @@ async function call(tabId, func, args) {
   return result;
 }
 
+/* --------------------------- cross-origin stylesheets --------------------------- */
+
+// href -> Promise<cssText | null>, for the life of the service worker.
+const sheetCache = new Map();
+const SHEET_CACHE_MAX = 200;
+const SHEET_MAX_BYTES = 8 * 1024 * 1024;
+
+/**
+ * Fetch a stylesheet the page cannot read. Cookies are never sent, and the
+ * response must be served as CSS -- the browser only applied the original
+ * because it was, and this keeps the extension from being turned into a way to
+ * read arbitrary cross-origin text into the page.
+ */
+function fetchSheet(href) {
+  if (!/^https?:/i.test(href)) return Promise.resolve(null);
+  if (!sheetCache.has(href)) {
+    if (sheetCache.size >= SHEET_CACHE_MAX) sheetCache.delete(sheetCache.keys().next().value);
+    sheetCache.set(
+      href,
+      (async () => {
+        try {
+          const r = await fetch(href, { credentials: 'omit', cache: 'force-cache' });
+          if (!r.ok || !/\btext\/css\b/i.test(r.headers.get('content-type') || '')) return null;
+          const text = await r.text();
+          return text.length > SHEET_MAX_BYTES ? null : text;
+        } catch {
+          return null;
+        }
+      })().then((t) => {
+        if (t === null) sheetCache.delete(href); // retry next time instead of caching a failure
+        return t;
+      })
+    );
+  }
+  return sheetCache.get(href);
+}
+
+/** Give the library every stylesheet it cannot read itself. Best effort. */
+async function supplySheets(tabId) {
+  const hrefs = (await exec(tabId, unreadableSheets, [])) || [];
+  if (!hrefs.length) return;
+  const texts = await Promise.all(hrefs.map(fetchSheet));
+  const map = {};
+  hrefs.forEach((h, i) => { if (texts[i] !== null) map[h] = texts[i]; });
+  if (Object.keys(map).length) await exec(tabId, provideSheets, [map]);
+}
+
+async function analyze(tabId, selector) {
+  await ensureLibrary(tabId);
+  await supplySheets(tabId).catch(() => {});
+  const [hit] = await chrome.scripting
+    .executeScript({ target: { tabId }, world: 'ISOLATED', func: closedShadowHosts, args: [selector] })
+    .catch(() => []);
+  const closed = hit && Array.isArray(hit.result) ? hit.result : undefined;
+  return call(tabId, runAnalysis, [selector, { closedShadowHosts: closed }]);
+}
+
 /* ------------------------------ message router ------------------------------ */
 
 async function handle(msg) {
@@ -71,9 +133,9 @@ async function handle(msg) {
     case 'reinject':
       return { ok: true, ...(await ensureLibrary(tabId, true)) };
     case 'analyze':
-      return call(tabId, runAnalysis, [msg.selector]);
+      return analyze(tabId, msg.selector);
     case 'apply':
-      return call(tabId, applySnippet, [msg.code]);
+      return call(tabId, applySnippet, [msg.plan]);
     case 'clear':
       return call(tabId, clearSnippet, []);
     // Neither of these needs the library, so they skip the injection check.

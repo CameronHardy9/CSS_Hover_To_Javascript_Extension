@@ -1,0 +1,48 @@
+# Runs the full Playwright suite (unit + the real extension end-to-end) whenever
+# a release is published. Can also be started by hand from the Actions tab.
+name: Test
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name || github.ref }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      # The e2e suite loads the extension, which needs the full Chromium build
+      # (channel: 'chromium'), not just the headless shell.
+      - run: npx playwright install --with-deps chromium
+
+      - run: npm test
+
+      - name: Package the extension
+        run: npm run package
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: extension-zip
+          path: dist/*.zip
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: playwright-results
+          path: test-results/
+          retention-days: 14

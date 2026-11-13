@@ -101,7 +101,6 @@ header {
   color: var(--fg-dim);
   white-space: nowrap;
 }
-.badge.limited { border-color: var(--warn); color: var(--warn); }
 .badge.off { border-color: var(--bad); color: var(--bad); }
 
 /* -------------------------------- layout -------------------------------- */

@@ -82,7 +82,9 @@ Three consequences worth knowing:
 - **Values come from the rules, not from computed styles.** `var(--brand-600)`,
   `calc()`, `clamp()`, custom properties and `!important` survive into the JavaScript, so the
   design tokens and the logic are preserved rather than flattened into resolved values.
-  Computed styles are used only to confirm a declaration actually changes something.
+  Computed styles are used only to confirm a declaration actually changes something. The values
+  are read back through the CSSOM, which canonicalises some of them without changing what they
+  mean: `calc(1px + 0.01em)` comes back as `calc(0.01em + 1px)`.
 - **Matching both ways.** An element is affected if a rule's match status *changes*, in either
   direction — which catches inverted rules like `li:not(:hover)`, where hovering *removes* a
   declaration.
@@ -121,6 +123,14 @@ affected element, with no residue afterwards — including no leftover `style`/`
 text. Transitions and animations are frozen while measuring so the comparison reads settled
 end states instead of interpolated ones; the emitted snippet leaves motion alone.
 
+Shorthands are skipped — their longhands are all compared anyway, and a shorthand's computed
+serialisation can differ while every longhand is identical (Chrome writes `text-decoration` as
+`underline` for `currentcolor` but `underline rgb(…)` for the same colour stated explicitly).
+On a page whose CSP forbids eval, the snippet string cannot be run, so the same data is checked
+through the eval-free `cssHoverToJS.toggle(plan)` instead; `verification.checked` says which
+(`'snippet'` or `'plan'`). Everything the analyzer injects while measuring is a constructed
+stylesheet, which a strict `style-src` CSP does not block.
+
 Run `fixture.html` for the covered cases: descendant subjects, sibling combinators,
 pseudo-elements, `:has(:hover)`, cascade layers, CSS nesting, shorthand collapsing, big
 fan-out, shadow DOM + `adoptedStyleSheets`, `!important` on both sides, pre-existing style
@@ -129,10 +139,17 @@ swaps a custom property consumed by descendants.
 
 ## Limits, all surfaced as warnings
 
-- **Cross-origin stylesheets are unreadable.** CSSOM denies access, so hover rules from a
-  third-party CDN sheet are invisible. The sheet is named in a warning rather than silently
-  skipped.
-- **Closed shadow roots** cannot be inspected at all.
+- **Cross-origin stylesheets are unreadable from page script.** CSSOM denies access, so hover
+  rules from a third-party CDN sheet are invisible to `cssHoverToJS` run from the console. The
+  sheet is named in a warning rather than silently skipped. Something that *can* fetch it (the
+  extension does) passes the text in with `cssHoverToJS.provideSheets({ [href]: cssText })`; the
+  rules are then analysed in the original sheet's place. `cssHoverToJS.unreadableSheets()` lists
+  what is missing.
+- **Closed shadow roots** cannot be inspected at all. They only matter when the host is on the
+  hover chain (the target or an ancestor), so that is the only time they are reported. Page
+  script cannot tell a closed shadow host from an ordinary element, so on its own the library
+  guesses (an empty custom element on the chain); a caller that knows, like the extension, passes
+  `closedShadowHosts: [...]`.
 - **`@container` conditions** cannot be evaluated from script; those rules are assumed to apply.
 - **Stylesheet-mode rules are appended last**, so a same-specificity non-hover rule that
   originally came after them could end up overridden. `verify: true` detects it.
@@ -216,23 +233,66 @@ raises a *"this snippet may be incomplete"* line in the panel. That one has to b
 always-on verify cannot catch it: the analyzer cannot read those rules, so it cannot rewrite them
 for the ground-truth snapshot either, and the comparison passes on an answer that is wrong.
 
-The single **Apply hover** button flips to **Clear hover** once the state is applied. It always
-runs the *toggle* snippet, not the apply-only one the user sees, because only the toggle form has a
-restore path. Analyzing again clears the hover first — reading the page with inline styles already
+The single **Apply hover** button flips to **Clear hover** once the state is applied. It runs the
+result's `plan` — the snippet's data without its code — through `cssHoverToJS.toggle(plan)`, which
+does exactly what the toggle snippet does without any eval, so it works on pages whose CSP forbids
+eval (GitHub, MDN). A unit test applies both to every fixture case and requires identical DOM and
+computed styles. Analyzing again clears the hover first — reading the page with inline styles already
 applied would treat them as the base state. Nothing is truncated, either: `report()` caps at 25
 elements and 40 verify diffs, and the panel shows all of them.
 
 ### Where it cannot help
 
-- **Pages whose CSP omits `unsafe-eval`.** Verification and the hover button both have to execute
-  the generated snippet, and `new Function` is refused on such a page — in the page's world by the page
-  CSP, and in the extension's isolated world by the extension's own MV3 CSP, which cannot be
-  relaxed. There is no world that escapes both. The panel probes for this when it opens, shows an
-  **eval blocked** badge, disables the hover button and skips verification rather than failing it.
-  Analysis, the report and the snippet all still work; paste the snippet into that page's DevTools
-  console, which is exempt.
 - **The top frame only.** Elements inside iframes are neither pickable nor analyzable.
 - **Restricted pages** — `chrome://`, the Web Store, other extensions — refuse injection entirely.
-- **Closed shadow roots** cannot be picked, the same way they cannot be analyzed.
-- **A `:nth-of-type` selector goes stale** if the DOM reorders between picking and analyzing. The
-  live `Matches …` count is the tell.
+- **Closed shadow roots** cannot be picked or read. The extension does detect them with
+  `chrome.dom.openOrClosedShadowRoot`, and raises the *may be incomplete* line only when one sits
+  on the hover chain.
+- **A `:nth-of-type` selector goes stale** if the DOM reorders between picking and analyzing.
+  Picked selectors (and snippet paths) are anchored to the nearest ancestor id whenever position
+  is what makes them unique, so only changes inside that ancestor can retarget them. The live
+  `Matches …` count is the tell.
+
+### Cross-origin stylesheets
+
+Before each analysis the service worker asks the library which stylesheets the page cannot read
+and fetches them itself, using the extension's host permission. The fetch never sends cookies,
+and the response must be served as `text/css` — the browser applied the original only because it
+was, and this keeps the extension from becoming a way to pull arbitrary cross-origin text into a
+page. A sheet that cannot be fetched still raises the *may be incomplete* line.
+
+## Tests
+
+```sh
+npm install
+npx playwright install chromium
+npm test             # everything
+npm run test:unit    # library, inject.js and picker.js in a plain page
+npm run test:e2e     # the real extension + side panel, driven like a user
+```
+
+- `tests/unit/fixture.spec.mjs` pins every case in `fixture.html`.
+- `tests/unit/inject.spec.mjs` runs the `inject.js` functions through `page.evaluate`, which
+  serialises them exactly as `executeScript` does. CSP cases go through `inPage()`, because
+  `page.evaluate` is exempt from the eval CSP the same way the DevTools console is.
+- `tests/unit/picker.spec.mjs` drives `picker.js` with a real mouse, `chrome.runtime` stubbed.
+- `tests/unit/realworld.spec.mjs` holds patterns reduced from a live-site sweep.
+- `tests/unit/package.spec.mjs` guards the list of files that ship.
+- Tests marked `test.fail` are known gaps: they pass while the gap exists and start failing
+  once it is fixed, which is the cue to remove the marker.
+- The e2e suite loads only the git-tracked runtime files (`manifest.json`,
+  `cssHoverToJavascript.js`, `extension/`), not the repo root, so `node_modules/` and `tests/`
+  never end up inside the loaded extension. `scripts/runtime-files.mjs` owns that list.
+
+### Packaging and CI
+
+The repo root doubles as the extension root, so never zip the root directly: it would include
+`node_modules/`. Instead:
+
+```sh
+npm run package      # -> dist/css-hover-to-js-<version>.zip, runtime files only
+```
+
+`.github/workflows/test.yml` runs the whole suite (unit and e2e, headless Chromium with the
+extension loaded) every time a GitHub release is published, then uploads the packaged zip as a
+workflow artifact. It can also be started by hand from the Actions tab.

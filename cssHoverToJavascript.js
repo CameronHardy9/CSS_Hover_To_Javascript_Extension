@@ -29,7 +29,14 @@
  *
  * Values are carried through AS AUTHORED -- var(), calc(), clamp(), custom
  * properties, !important -- never as resolved computed values, so design
- * tokens and cascade logic survive into the JavaScript.
+ * tokens and cascade logic survive into the JavaScript. (The browser does
+ * canonicalise some of them on the way through the CSSOM: calc() terms are
+ * reordered, colours keep their authored form.)
+ *
+ * PAGES THAT FORBID EVAL
+ * Every result also carries `plan`, the snippet's data without its code, and
+ * cssHoverToJS.toggle(plan) applies it with no eval at all. verify uses that
+ * path automatically when the page CSP blocks `new Function`.
  * ----------------------------------------------------------------------------
  */
 (() => {
@@ -247,17 +254,94 @@
   /** Every root whose stylesheets we can read: document + open shadow roots. */
   function allRoots() {
     const roots = [document];
-    let closedSuspects = 0;
     const visit = (root) => {
       let els;
       try { els = root.querySelectorAll('*'); } catch { return; }
       for (const el of els) {
         if (el.shadowRoot) { roots.push(el.shadowRoot); visit(el.shadowRoot); }
-        else if (el.localName.includes('-') && !el.firstElementChild) closedSuspects++;
       }
     };
     visit(document);
-    return { roots, closedSuspects };
+    return roots;
+  }
+
+  /* ---------------------- stylesheets read on our behalf ---------------------- */
+
+  // href -> detached CSSStyleSheet parsed from text someone else fetched (the
+  // extension's service worker can read cross-origin CSS; page script cannot).
+  const provided = new Map();
+
+  /** Make relative url()s absolute -- the copy no longer lives at `base`. */
+  function absolutizeUrls(text, base) {
+    return text.replace(/url\(\s*(['"]?)([^'")]*?)\1\s*\)/gi, (m, q, ref) => {
+      if (!ref || /^(data:|[a-z][a-z\d+.-]*:|#)/i.test(ref)) return m;
+      try { return `url(${q || '"'}${new URL(ref, base).href}${q || '"'})`; } catch { return m; }
+    });
+  }
+
+  /**
+   * Hand over the text of stylesheets the page cannot read: { href: cssText }.
+   * They are parsed into detached copies and analysed in the original sheet's
+   * place. Returns the hrefs accepted.
+   */
+  function provideSheets(map) {
+    const ok = [];
+    for (const [href, text] of Object.entries(map || {})) {
+      if (typeof text !== 'string') continue;
+      try {
+        const clean = absolutizeUrls(text.replace(/\/\*[\s\S]*?\*\//g, ''), href);
+        const sheet = new CSSStyleSheet();
+        sheet.replaceSync(clean);
+        // The same text with :hover swapped for the probe attribute, cut down to
+        // the rules that hover. It is the ground truth for these rules: parsed
+        // from source, so it keeps what the CSSOM cannot serialise back (a
+        // var() shorthand with one longhand overridden reads as "prop: ;").
+        const probed = new CSSStyleSheet();
+        probed.replaceSync(replaceHover(clean, PROBE_SEL).text);
+        pruneToProbed(probed);
+        provided.set(href, { sheet, probed });
+        ok.push(href);
+      } catch { /* not parseable as a constructed sheet -- stays unreadable */ }
+    }
+    return ok;
+  }
+
+  /** Delete every rule that does not involve the probe attribute. Returns whether any remain. */
+  function pruneToProbed(group) {
+    const list = group.cssRules;
+    for (let i = list.length - 1; i >= 0; i--) {
+      const rule = list[i];
+      const own = rule.selectorText !== undefined && rule.selectorText.includes(PROBE_SEL);
+      const kids = rule.cssRules && rule.cssRules.length ? pruneToProbed(rule) : false;
+      if (!own && !kids) {
+        try { group.deleteRule(i); } catch { /* leave it */ }
+      }
+    }
+    return group.cssRules.length > 0;
+  }
+
+  /** hrefs of stylesheets (including @imports) the page cannot read and nobody has provided. */
+  function unreadableSheets() {
+    const out = new Set();
+    const seen = new Set();
+    const visit = (sheet) => {
+      if (!sheet || seen.has(sheet)) return;
+      seen.add(sheet);
+      let list;
+      try { list = sheet.cssRules; } catch {
+        if (sheet.href && !provided.has(sheet.href)) out.add(sheet.href);
+        return;
+      }
+      for (const rule of list || []) {
+        if (is(rule, 'CSSImportRule')) visit(rule.styleSheet);
+        else if (!is(rule, 'CSSLayerStatementRule')) break; // @import rules can only come first
+      }
+    };
+    for (const root of allRoots()) {
+      for (const sheet of root.styleSheets || []) visit(sheet);
+      for (const sheet of root.adoptedStyleSheets || []) visit(sheet);
+    }
+    return [...out];
   }
 
   /** Resolve a nested selector against its parent selector list (CSS nesting). */
@@ -279,7 +363,7 @@
     const warnings = [];
     const rules = [];
     const layerIndex = new Map();
-    const { roots, closedSuspects } = allRoots();
+    const roots = allRoots();
     const seen = new Set();
     let order = 0;
 
@@ -336,28 +420,32 @@
       if (seen.has(sheet)) return;
       seen.add(sheet);
       let list;
+      const own = sheet.ownerNode ? sheet.ownerNode.getRootNode() : scope;
+      const where = own === document || own.host ? own : scope;
       try { list = sheet.cssRules; } catch {
+        const copy = sheet.href && provided.get(sheet.href);
+        if (copy) {
+          // Read from the copy, in the original's place in source order. Its
+          // rules are not the live ones, so they cannot be rewritten in place.
+          if (sheet.disabled) return;
+          walkList(copy.sheet.cssRules, where, { ...ctx, detached: copy });
+          return;
+        }
         warnings.push(
           `Cross-origin stylesheet is unreadable, its hover rules are invisible: ${sheet.href || '<inline>'}`
         );
         return;
       }
       if (!list) return;
-      const own = sheet.ownerNode ? sheet.ownerNode.getRootNode() : scope;
-      walkList(list, own === document || own.host ? own : scope, ctx);
+      walkList(list, where, ctx);
     };
 
-    const baseCtx = { conditions: [], layer: null, parentSel: null };
+    const baseCtx = { conditions: [], layer: null, parentSel: null, detached: false };
     for (const root of roots) {
       for (const sheet of root.styleSheets || []) walkSheet(sheet, root, baseCtx);
       for (const sheet of root.adoptedStyleSheets || []) walkSheet(sheet, root, baseCtx);
     }
 
-    if (closedSuspects) {
-      warnings.push(
-        `${closedSuspects} custom element(s) expose no open shadowRoot; styles inside a closed shadow root cannot be read.`
-      );
-    }
     return { rules, warnings, layerIndex };
   }
 
@@ -376,6 +464,7 @@
       layer: ctx.layer,
       order,
       isNestedDecls,
+      detached: ctx.detached || null, // the provided-sheet record, for rules read from a copy
       decls,
       owner,
       props: [...owner.keys()],
@@ -494,8 +583,15 @@
    */
   function withHoverForced(hoverRules, hosts, fn, warnings) {
     const undo = [];
-    let fallbackSheet = null;
-    const fallbackText = [];
+    const fallback = new Map(); // scope -> [rule text]
+    const addFallback = (entry) => {
+      const text = wrapConditions(entry, `${replaceHover(entry.sel, PROBE_SEL).text}{${entry.rule.style.cssText}}`);
+      if (!fallback.has(entry.scope)) fallback.set(entry.scope, []);
+      fallback.get(entry.scope).push(text);
+    };
+    const probedCopies = new Map(); // provided record -> scope
+    let removeSheets = () => {};
+    let removeProbed = () => {};
     try {
       for (const entry of hoverRules) {
         if (entry.isNestedDecls) continue; // covered by its parent rule
@@ -503,31 +599,74 @@
         // A nested rule like `& > .c` inherits :hover from its parent rule;
         // there is nothing local to rewrite and the parent handles it.
         if (hoverCount(original) === 0) continue;
+        if (entry.detached) {
+          // A copy of a cross-origin sheet: rewriting it would change nothing
+          // on the page, and the live original cannot be touched. Its probed
+          // twin, parsed from the source text, goes on the end of the cascade.
+          probedCopies.set(entry.detached, entry.scope);
+          if (warnings) warnings.add('Ground truth for rules from provided cross-origin stylesheets uses an appended stylesheet (cascade position approximated).');
+          continue;
+        }
         const probed = replaceHover(original, PROBE_SEL).text;
         try {
           entry.rule.selectorText = probed;
         } catch { /* fall through to the check below */ }
         if (entry.rule.selectorText === original) {
-          fallbackText.push(wrapConditions(entry, `${replaceHover(entry.sel, PROBE_SEL).text}{${entry.rule.style.cssText}}`));
+          addFallback(entry);
           if (warnings) warnings.add('Some rules could not be rewritten in place; ground truth for them used an appended stylesheet (cascade position approximated).');
         } else {
           undo.push([entry.rule, original]);
         }
       }
-      if (fallbackText.length) {
-        fallbackSheet = document.createElement('style');
-        fallbackSheet.textContent = fallbackText.join('\n');
-        document.head.appendChild(fallbackSheet);
+      removeSheets = adoptAll([...fallback].map(([scope, texts]) => [scope, texts.join('\n')]));
+      const adopted = [];
+      for (const [rec, scope] of probedCopies) {
+        const root = scope && scope.adoptedStyleSheets ? scope : document;
+        root.adoptedStyleSheets = [...root.adoptedStyleSheets, rec.probed];
+        adopted.push([root, rec.probed]);
       }
+      removeProbed = () => {
+        for (const [root, sh] of adopted) root.adoptedStyleSheets = root.adoptedStyleSheets.filter((x) => x !== sh);
+      };
       for (const h of hosts) h.setAttribute(PROBE, '');
       return fn();
     } finally {
       for (const h of hosts) h.removeAttribute(PROBE);
-      if (fallbackSheet) fallbackSheet.remove();
+      removeSheets();
+      removeProbed();
       for (const [rule, sel] of undo) {
         try { rule.selectorText = sel; } catch { /* nothing else we can do */ }
       }
     }
+  }
+
+  /**
+   * Temporarily add stylesheets to the end of each scope's cascade. Constructed
+   * sheets, not <style> elements: a page CSP without 'unsafe-inline' in
+   * style-src blocks the latter but not the former. Returns the undo.
+   */
+  function adoptAll(pairs) {
+    const added = [];
+    for (const [scope, text] of pairs) {
+      const root = scope && scope.adoptedStyleSheets ? scope : document;
+      try {
+        const sheet = new CSSStyleSheet();
+        sheet.replaceSync(text);
+        root.adoptedStyleSheets = [...root.adoptedStyleSheets, sheet];
+        added.push([root, sheet]);
+      } catch {
+        const el = document.createElement('style');
+        el.textContent = text;
+        (root === document ? document.head : root).appendChild(el);
+        added.push([null, el]);
+      }
+    }
+    return () => {
+      for (const [root, sheet] of added) {
+        if (!root) sheet.remove();
+        else root.adoptedStyleSheets = root.adoptedStyleSheets.filter((s) => s !== sheet);
+      }
+    };
   }
 
   function wrapConditions(entry, inner) {
@@ -679,7 +818,12 @@
     try { return parent.querySelectorAll(`:scope > ${compound}`).length > 1; } catch { return true; }
   };
 
-  /** Shortest stable selector for `el` within its own root. */
+  /**
+   * Shortest stable selector for `el` within its own root.
+   *
+   * extension/picker.js carries a copy of this function (it runs in another
+   * world and cannot import it); keep the two in step.
+   */
   function selectorWithin(el, root) {
     if (el.id && okIdent(el.id) && unique(root, `#${CSS.escape(el.id)}`, el)) return `#${CSS.escape(el.id)}`;
     for (const attr of ['data-testid', 'data-test', 'data-qa', 'data-cy', 'name', 'aria-label']) {
@@ -689,32 +833,47 @@
         if (unique(root, sel, el)) return sel;
       }
     }
+    const compound = (cur) => {
+      let s = cur.localName;
+      s += [...cur.classList]
+        .filter((c) => okIdent(c) && c !== ON_CLASS)
+        .slice(0, 2)
+        .map((c) => `.${CSS.escape(c)}`)
+        .join('');
+      // Disambiguate against siblings the compound cannot tell apart --
+      // classes alone are not enough when siblings share them.
+      const par = cur.parentElement;
+      if (par && ambiguous(par, s)) {
+        const sibs = [...par.children].filter((x) => x.localName === cur.localName);
+        if (sibs.length > 1) s += `:nth-of-type(${sibs.indexOf(cur) + 1})`;
+      }
+      return s;
+    };
     const parts = [];
     let cur = el;
+    let found = null;
     while (cur && cur.nodeType === 1 && cur !== root) {
-      if (cur.id && okIdent(cur.id)) {
-        parts.unshift(`#${CSS.escape(cur.id)}`);
-      } else {
-        let s = cur.localName;
-        s += [...cur.classList]
-          .filter((c) => okIdent(c) && c !== ON_CLASS)
-          .slice(0, 2)
-          .map((c) => `.${CSS.escape(c)}`)
-          .join('');
-        // Disambiguate against siblings the compound cannot tell apart --
-        // classes alone are not enough when siblings share them.
-        const par = cur.parentElement;
-        if (par && ambiguous(par, s)) {
-          const sibs = [...par.children].filter((x) => x.localName === cur.localName);
-          if (sibs.length > 1) s += `:nth-of-type(${sibs.indexOf(cur) + 1})`;
-        }
-        parts.unshift(s);
-      }
+      parts.unshift(cur.id && okIdent(cur.id) ? `#${CSS.escape(cur.id)}` : compound(cur));
       const cand = parts.join(' > ');
-      if (unique(root, cand, el)) return cand;
+      if (unique(root, cand, el)) { found = cand; break; }
       cur = cur.parentElement;
     }
-    return parts.join(' > ') || el.localName;
+    if (!found) return parts.join(' > ') || el.localName;
+    // A chain that is unique only by position or through bare tag names is
+    // unique only by luck: any similar markup the page adds later (a lazy-loaded
+    // list, an ad slot) retargets it. Anchor it to the nearest ancestor with an
+    // id, so only changes inside that ancestor can.
+    const fragile = !found.startsWith('#') && parts.some((p) => p.includes(':nth-of-type(') || /^[\w-]+$/.test(p));
+    if (!fragile) return found;
+    for (let a = cur.parentElement; a && a.nodeType === 1 && a !== root; a = a.parentElement) {
+      if (!a.id || !okIdent(a.id) || !unique(root, `#${CSS.escape(a.id)}`, a)) continue;
+      for (let n = 1; n <= parts.length; n++) {
+        const sel = `#${CSS.escape(a.id)} ${parts.slice(-n).join(' > ')}`;
+        if (unique(root, sel, el)) return sel;
+      }
+      break;
+    }
+    return found;
   }
 
   /** Path as an array of segments, one per shadow boundary crossed. */
@@ -764,6 +923,22 @@
     const applyOnly = !!opts.applyOnly;
     const collected = collectRules();
     collected.warnings.forEach((w) => warnings.add(w));
+    const chain = hoverChain(target);
+
+    // A closed shadow root only matters when its host is in the hover chain:
+    // the rules inside it can react to hover only through :host(:hover),
+    // ::slotted(:hover) or an inner element being hovered -- all of which need
+    // the host itself to be hovered. Page script cannot see closed roots, so
+    // callers that can (the extension, via chrome.dom) pass the list in;
+    // otherwise an empty hyphenated element in the chain is the best guess.
+    const closed = Array.isArray(opts.closedShadowHosts)
+      ? opts.closedShadowHosts
+      : chain.filter((el) => !el.shadowRoot && el.localName.includes('-') && !el.firstElementChild).map(describe);
+    if (closed.length) {
+      warnings.add(
+        `The hover chain passes through ${closed.length} element(s) with a closed shadow root (${closed.join(', ')}); styles inside a closed shadow root cannot be read.`
+      );
+    }
 
     const active = collected.rules.filter((e) => conditionsActive(e, warnings));
     const hoverRules = active.filter((e) => e.hovers > 0 && e.hoverBranches.length);
@@ -780,8 +955,6 @@
     });
 
     if (!hoverRules.length) return nothing();
-
-    const chain = hoverChain(target);
 
     // 1. Attribution: probe each chain element on its own.
     const groups = [];
@@ -909,7 +1082,12 @@
         // Emit the authored shorthand only if this declaration owns every
         // longhand it covers; otherwise another rule wins part of it and the
         // shorthand would clobber that.
-        const ownsAll = decl.longhands.every((lh) => (hoverWin.get(lh) || {}).declKey === win.declKey);
+        // An empty authored value is the CSSOM's way of saying the token is
+        // gone (a var() shorthand with one longhand overridden serialises as
+        // "text-decoration-line: ;"), so that also goes the per-longhand way,
+        // which falls back to the resolved value.
+        const ownsAll =
+          decl.value !== '' && decl.longhands.every((lh) => (hoverWin.get(lh) || {}).declKey === win.declKey);
         if (ownsAll) {
           decl.longhands.forEach((lh) => done.add(lh));
           decls[decl.name] = [decl.value, priority];
@@ -922,7 +1100,7 @@
             // authored token is unreachable, fall back to the resolved value.
             value = hoverCS[prop] || '';
             warnings.add(
-              `"${decl.name}" on ${describe(rec.el)} is partly overridden by another rule, so ${prop} is emitted as its resolved value rather than the authored token.`
+              `"${decl.name}" on ${describe(rec.el)} is partly overridden, which leaves its var() unreadable through the CSSOM, so ${prop} is emitted as its resolved value rather than the authored token.`
             );
           }
           if (value) decls[prop] = [value, priority];
@@ -961,6 +1139,7 @@
       groups: effective,
       affected,
       snippet: built.snippet,
+      plan: built.plan,
       mode: built.mode,
       applyOnly,
       warnings: [...warnings],
@@ -982,10 +1161,7 @@
    * Only ever used while measuring -- the emitted snippet leaves motion alone.
    */
   function freezeMotion() {
-    const el = document.createElement('style');
-    el.textContent = '*,*::before,*::after{transition:none !important;animation:none !important}';
-    document.head.appendChild(el);
-    return () => el.remove();
+    return adoptAll([[document, '*,*::before,*::after{transition:none !important;animation:none !important}']]);
   }
 
   function snapshot(el, props) {
@@ -1134,11 +1310,103 @@
     return {
       snippet: opts.applyOnly ? buildApplyOnly() : toggle,
       verifySnippet: toggle, // verification needs a restore path
+      // The same data the snippets embed, without the code around it. toggle()
+      // runs it with no eval, for pages whose CSP forbids executing a string.
+      plan: {
+        targets: inline.map((r, i) => [paths[i], r.decls]),
+        hosts: css ? hosts.map(pathTo) : [],
+        sheets,
+      },
       mode: css ? (inline.length ? 'inline+css' : 'css') : 'inline',
     };
   }
 
+  /* =========================== eval-free runtime =========================== */
+
+  /**
+   * The toggle snippet's behaviour as an ordinary function over its data, so a
+   * page that forbids eval can still apply and clear a hover. It must stay
+   * statement-for-statement equivalent to buildToggle(); a test applies both to
+   * every fixture case and compares the resulting DOM and computed styles.
+   */
+  function hoverToggle(plan) {
+    const d = document;
+    const R = (p) => {
+      let n = d;
+      for (const s of p) {
+        n = (n.shadowRoot || n).querySelector(s);
+        if (!n) return null;
+      }
+      return n;
+    };
+    const targets = plan.targets || [];
+    const hosts = plan.hosts || [];
+    const S = (plan.sheets || []).map(([p, t]) => {
+      const s = d.createElement('style');
+      s.textContent = t;
+      return [p, s];
+    });
+    const P = new Map(), C = new Map();
+    let on = false;
+    const applyHover = () => {
+      if (on) return;
+      on = true;
+      if (S.length) {
+        for (const [p, s] of S) {
+          const r = p ? R(p) : null;
+          ((r && r.shadowRoot) || d.head).appendChild(s);
+        }
+        for (const p of hosts) {
+          const e = R(p);
+          if (!e) continue;
+          C.set(e, e.getAttribute('class'));
+          e.classList.add(ON_CLASS);
+        }
+      }
+      for (const [p, ds] of targets) {
+        const e = R(p);
+        if (!e) continue;
+        P.set(e, e.getAttribute('style'));
+        for (const k in ds) e.style.setProperty(k, ds[k][0], ds[k][1]);
+      }
+    };
+    const clearHover = () => {
+      if (!on) return;
+      on = false;
+      for (const [e, s] of P) {
+        if (s === null) { e.getAttribute('style'); e.removeAttribute('style'); }
+        else e.setAttribute('style', s);
+      }
+      P.clear();
+      if (S.length) {
+        for (const [e, c] of C) c === null ? e.removeAttribute('class') : e.setAttribute('class', c);
+        C.clear();
+        for (const [, s] of S) s.remove();
+      }
+    };
+    return { applyHover, clearHover };
+  }
+
   /* ============================== verify ============================== */
+
+  /**
+   * Shorthands are not compared: their computed serialisation can differ while
+   * every longhand is identical (Chrome writes `text-decoration` as "underline"
+   * for currentcolor but "underline rgb(...)" for the same colour stated
+   * explicitly), and the longhands are compared anyway.
+   */
+  const shorthandCache = new Map();
+  function isShorthand(prop) {
+    if (prop.startsWith('--')) return false;
+    let hit = shorthandCache.get(prop);
+    if (hit === undefined) {
+      const s = scratch();
+      s.setProperty(prop, 'initial');
+      hit = s.length > 1 || (s.length === 1 && s.item(0) !== prop);
+      shorthandCache.set(prop, hit);
+    }
+    return hit;
+  }
 
   /**
    * Compare three states property-by-property: baseline, true hover (rules
@@ -1151,7 +1419,7 @@
     const all = (el) => {
       const cs = getComputedStyle(el);
       const out = {};
-      for (let i = 0; i < cs.length; i++) out[cs[i]] = cs.getPropertyValue(cs[i]);
+      for (let i = 0; i < cs.length; i++) if (!isShorthand(cs[i])) out[cs[i]] = cs.getPropertyValue(cs[i]);
       return out;
     };
 
@@ -1170,12 +1438,21 @@
 
     const prev = [window.applyHover, window.clearHover];
     let api;
+    let checked = 'snippet';
     const diffs = [];
     try {
       // Always the toggle form: verification needs a restore path to check
       // residue against. It shares the identical apply statements with the
       // apply-only form, so the hover state it proves is the same one.
-      api = new Function(`return ${result._internals.verifySnippet}`)();
+      try {
+        api = new Function(`return ${result._internals.verifySnippet}`)();
+      } catch (e) {
+        // The page CSP forbids eval. Check the same data through the eval-free
+        // runtime instead of giving up on verification.
+        if (!(e && e.name === 'EvalError') && !/unsafe-eval|Content Security Policy/i.test(String(e && e.message))) throw e;
+        api = hoverToggle(result.plan);
+        checked = 'plan';
+      }
       api.applyHover();
       const sim = els.map(all);
       api.clearHover();
@@ -1211,7 +1488,7 @@
       if (prev[0] === undefined) delete window.applyHover;
       if (prev[1] === undefined) delete window.clearHover;
     }
-    const out = { pass: diffs.length === 0, diffs };
+    const out = { pass: diffs.length === 0, diffs, checked };
     if (result.applyOnly) {
       out.note =
         'Checked against the toggle form, which applies the same declarations; the emitted apply-only snippet has no restore path, so its residue checks do not apply.';
@@ -1309,5 +1586,11 @@
     return res;
   };
 
-  window.cssHoverToJS.version = '1.0.0';
+  window.cssHoverToJS.version = '1.1.0';
+  /** Apply a result's `plan` without eval: returns { applyHover, clearHover }. */
+  window.cssHoverToJS.toggle = hoverToggle;
+  /** { href: cssText } for cross-origin sheets fetched elsewhere; see provideSheets(). */
+  window.cssHoverToJS.provideSheets = provideSheets;
+  /** hrefs of stylesheets this page cannot read and that have not been provided. */
+  window.cssHoverToJS.unreadableSheets = unreadableSheets;
 })();

@@ -13,20 +13,60 @@
  */
 
 /**
- * Report whether the library is present and whether this page can run generated
- * code at all.
+ * Report whether the library is present.
  *
- * `verify: true` and the Apply / Clear buttons both need `new Function`, which a
- * page whose CSP omits 'unsafe-eval' forbids. Probing once, up front, lets the
- * panel disable exactly those two features and say why, rather than letting the
- * user click and get an exception. Analysis and snippet generation need no eval.
+ * Nothing the extension runs needs eval any more: verify and the Apply / Clear
+ * button go through the library's eval-free `toggle(plan)`, so a page CSP without
+ * 'unsafe-eval' no longer limits anything here.
  */
 export function getCapabilities() {
-  let evalOk = false;
+  return { version: (window.cssHoverToJS && window.cssHoverToJS.version) || null };
+}
+
+/**
+ * hrefs of stylesheets the page cannot read (cross-origin, no CORS) and that
+ * have not been handed to the library yet. The service worker fetches these.
+ */
+export function unreadableSheets() {
+  const lib = window.cssHoverToJS;
+  return lib && typeof lib.unreadableSheets === 'function' ? lib.unreadableSheets() : [];
+}
+
+/** Hand fetched stylesheet text ({ href: cssText }) to the library. */
+export function provideSheets(map) {
+  const lib = window.cssHoverToJS;
+  return lib && typeof lib.provideSheets === 'function' ? lib.provideSheets(map) : [];
+}
+
+/**
+ * ISOLATED world only: describe every element on the target's hover chain that
+ * hosts a CLOSED shadow root. Page script cannot tell a closed shadow host from
+ * an ordinary element; chrome.dom.openOrClosedShadowRoot, which exists only for
+ * extensions, can. Returns null when that API or the target is unavailable, and
+ * the library then falls back to its own guess.
+ */
+export function closedShadowHosts(selector) {
+  const dom = typeof chrome !== 'undefined' && chrome.dom;
+  if (!dom || typeof dom.openOrClosedShadowRoot !== 'function') return null;
+  const desc = (el) =>
+    el.localName + (el.id ? '#' + el.id : '') +
+    [...el.classList].filter((c) => c !== 'cssh-on').slice(0, 2).map((c) => '.' + c).join('');
   try {
-    evalOk = new Function('return 1')() === 1;
-  } catch { /* page CSP forbids 'unsafe-eval' */ }
-  return { version: (window.cssHoverToJS && window.cssHoverToJS.version) || null, evalOk };
+    const segs = selector.split('>>>').map((s) => s.trim()).filter(Boolean);
+    let node = document;
+    for (const seg of segs) {
+      node = (node.shadowRoot || node).querySelector(seg);
+      if (!node) return null;
+    }
+    if (!segs.length) return null;
+    const out = [];
+    for (let el = node; el && el.nodeType === 1; el = el.parentElement || el.getRootNode().host || null) {
+      if (!el.shadowRoot && dom.openOrClosedShadowRoot(el)) out.push(desc(el));
+    }
+    return out;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -39,7 +79,7 @@ export function getCapabilities() {
  * The library options are not the caller's to choose, and neither is the console
  * report -- the extension is opinionated where the library is general.
  */
-export function runAnalysis(selector) {
+export function runAnalysis(selector, extra) {
   // The two warnings that mean the analyzer could not SEE some CSS, as opposed to
   // the ones describing how it chose to write the snippet. Always-on verify does
   // not catch these: unreadable rules cannot be rewritten for the ground-truth
@@ -78,21 +118,17 @@ export function runAnalysis(selector) {
   }
   if (!el) return { ok: false, error: 'Selector matched nothing on this page.' };
 
-  // Gated, not simply forced: the library's verify() calls `new Function` at
-  // cssHoverToJavascript.js:1178 inside a try/finally that does not catch, so on a
-  // page whose CSP forbids eval, asking for it would throw out of cssHoverToJS and
-  // cost us the entire result rather than just the verification.
-  let evalOk = false;
-  try {
-    evalOk = new Function('return 1')() === 1;
-  } catch { /* page CSP forbids 'unsafe-eval' */ }
+  const closed = extra && Array.isArray(extra.closedShadowHosts) ? extra.closedShadowHosts : undefined;
 
   let res;
   try {
     res = window.cssHoverToJS(el, {
       applyOnly: true, // the panel's own button covers apply/clear; the user sees only the apply form
-      verify: evalOk,
+      // Always on: when the page forbids eval the library checks the same data
+      // through its eval-free runtime instead of the snippet string.
+      verify: true,
       log: false, // logReport() below replaces the library's own console output
+      closedShadowHosts: closed,
     });
   } catch (e) {
     const msg = e && e.message ? e.message : String(e);
@@ -149,12 +185,12 @@ export function runAnalysis(selector) {
   if (res.verification) {
     const v = res.verification;
     console.log(
-      `%cverify: ${v.pass ? 'PASS -- matches the real hover state' : `FAIL -- ${v.diffs.length} mismatch(es)`}`,
+      `%cverify: ${v.pass ? 'PASS -- matches the real hover state' : `FAIL -- ${v.diffs.length} mismatch(es)`}${
+        v.checked === 'plan' ? ' (checked via the eval-free runtime; this page forbids eval)' : ''
+      }`,
       `color:${v.pass ? '#0a0' : '#c00'};font-weight:bold`
     );
     if (!v.pass) console.table(v.diffs.map((d) => ({ element: desc(d.el), prop: d.prop, expected: d.expected, got: d.got, kind: d.kind })));
-  } else {
-    console.log('verify: skipped -- this page’s CSP forbids eval.');
   }
   if (res.snippet) console.log(res.snippet);
   console.groupEnd();
@@ -178,7 +214,7 @@ export function runAnalysis(selector) {
     affected,
     // Whether verification actually ran, so the panel can tell "passed" apart
     // from "could not be checked". The full warning list stays in the console.
-    verified: evalOk,
+    verified: !!res.verification,
     incomplete: warnings.filter((w) => UNREADABLE.test(w)),
     // Only surfaced on failure; the library's applyOnly `note` is dropped because
     // it says residue checks do not apply to the emitted snippet -- true, but
@@ -198,14 +234,21 @@ export function runAnalysis(selector) {
         : null,
     // The apply-only form: what the user copies into a visual test.
     snippet: res.snippet,
-    // The toggle form, never shown -- it is what the panel's hover button drives,
-    // because it is the only one with a restore path.
-    verifySnippet: (res._internals && res._internals.verifySnippet) || res.snippet,
+    // The snippet's data without its code -- what the panel's hover button runs,
+    // through the library's eval-free toggle(), so it works under any page CSP.
+    plan: res.plan || null,
   };
 }
 
-/** Eval the toggle snippet and force the hover state on. */
-export function applySnippet(code) {
+/**
+ * Force the hover state on from a result's `plan`. No eval: the library's
+ * toggle() is ordinary code, so a CSP without 'unsafe-eval' does not stop it.
+ */
+export function applySnippet(plan) {
+  const lib = window.cssHoverToJS;
+  if (!lib || typeof lib.toggle !== 'function') {
+    return { ok: false, notInjected: true, error: 'cssHoverToJS is not present on this page.' };
+  }
   try {
     // Restore whatever a previous snippet applied first. Each snippet owns its own
     // captured style/class attributes, so applying a second one while the first is
@@ -214,17 +257,12 @@ export function applySnippet(code) {
     if (stale && typeof stale.clearHover === 'function') {
       try { stale.clearHover(); } catch { /* a re-render can leave it pointing at nothing */ }
     }
-    const api = new Function('return ' + code)();
+    const api = lib.toggle(plan);
     window.__csshApi = api;
     api.applyHover();
     return { ok: true };
   } catch (e) {
-    const msg = e && e.message ? e.message : String(e);
-    return {
-      ok: false,
-      error: msg,
-      cspBlocked: (e && e.name === 'EvalError') || /unsafe-eval|Content Security Policy/i.test(msg),
-    };
+    return { ok: false, error: e && e.message ? e.message : String(e) };
   }
 }
 
