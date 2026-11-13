@@ -6,10 +6,14 @@
  * produces -- one resolution path, and what the user reads in the field is exactly
  * what gets analyzed. Shadow boundaries are written `host >>> inner`.
  *
- * The selector logic mirrors the library's own private `selectorWithin`/`pathTo`
- * (cssHoverToJavascript.js:681-730) so a picked selector agrees with the paths the
- * generated snippets use: id, then a test/name attribute, then classes plus
- * :nth-of-type, verified unique at every step.
+ * The selector logic is a copy of the library's private `selectorWithin`/`pathTo`
+ * so a picked selector agrees with the paths the generated snippets use: id, then
+ * a test/name attribute, then classes plus :nth-of-type, verified unique at every
+ * step, and anchored to the nearest ancestor id when only position makes it unique.
+ *
+ * One difference: picking IS a real hover, and pages often add classes from JS on
+ * mouseenter (GitHub's `.open`). A selector built from those matches nothing once
+ * the mouse leaves, so classes that appeared after the picker started are skipped.
  */
 (() => {
   if (window.__csshPicker) return; // already picking
@@ -29,6 +33,21 @@
     }
   };
 
+  // element -> its class tokens from before the picker first saw them change.
+  // The picker starts while the mouse is over the side panel, so whatever the
+  // page adds after that is hover state, not identity.
+  const classesBefore = new WeakMap();
+  const noteClasses = (records) => {
+    for (const r of records) {
+      if (!classesBefore.has(r.target)) {
+        classesBefore.set(r.target, new Set((r.oldValue || '').split(/\s+/).filter(Boolean)));
+      }
+    }
+  };
+  const classWatch = new MutationObserver(noteClasses);
+  classWatch.observe(document, { attributes: true, attributeFilter: ['class'], attributeOldValue: true, subtree: true });
+  const hoverAdded = (el, c) => classesBefore.has(el) && !classesBefore.get(el).has(c);
+
   const ambiguous = (parent, compound) => {
     try {
       return parent.querySelectorAll(`:scope > ${compound}`).length > 1;
@@ -46,30 +65,47 @@
         if (unique(root, sel, el)) return sel;
       }
     }
+    const compound = (cur) => {
+      let s = cur.localName;
+      s += [...cur.classList]
+        .filter((c) => okIdent(c) && c !== ON_CLASS && !hoverAdded(cur, c))
+        .slice(0, 2)
+        .map((c) => `.${CSS.escape(c)}`)
+        .join('');
+      // Disambiguate against siblings the compound cannot tell apart --
+      // classes alone are not enough when siblings share them.
+      const par = cur.parentElement;
+      if (par && ambiguous(par, s)) {
+        const sibs = [...par.children].filter((x) => x.localName === cur.localName);
+        if (sibs.length > 1) s += `:nth-of-type(${sibs.indexOf(cur) + 1})`;
+      }
+      return s;
+    };
     const parts = [];
     let cur = el;
+    let found = null;
     while (cur && cur.nodeType === 1 && cur !== root) {
-      if (cur.id && okIdent(cur.id)) {
-        parts.unshift(`#${CSS.escape(cur.id)}`);
-      } else {
-        let s = cur.localName;
-        s += [...cur.classList]
-          .filter((c) => okIdent(c) && c !== ON_CLASS)
-          .slice(0, 2)
-          .map((c) => `.${CSS.escape(c)}`)
-          .join('');
-        const par = cur.parentElement;
-        if (par && ambiguous(par, s)) {
-          const sibs = [...par.children].filter((x) => x.localName === cur.localName);
-          if (sibs.length > 1) s += `:nth-of-type(${sibs.indexOf(cur) + 1})`;
-        }
-        parts.unshift(s);
-      }
+      parts.unshift(cur.id && okIdent(cur.id) ? `#${CSS.escape(cur.id)}` : compound(cur));
       const cand = parts.join(' > ');
-      if (unique(root, cand, el)) return cand;
+      if (unique(root, cand, el)) { found = cand; break; }
       cur = cur.parentElement;
     }
-    return parts.join(' > ') || el.localName;
+    if (!found) return parts.join(' > ') || el.localName;
+    // A chain that is unique only by position or through bare tag names is
+    // unique only by luck: any similar markup the page adds later (a lazy-loaded
+    // list, an ad slot) retargets it. Anchor it to the nearest ancestor with an
+    // id, so only changes inside that ancestor can.
+    const fragile = !found.startsWith('#') && parts.some((p) => p.includes(':nth-of-type(') || /^[\w-]+$/.test(p));
+    if (!fragile) return found;
+    for (let a = cur.parentElement; a && a.nodeType === 1 && a !== root; a = a.parentElement) {
+      if (!a.id || !okIdent(a.id) || !unique(root, `#${CSS.escape(a.id)}`, a)) continue;
+      for (let n = 1; n <= parts.length; n++) {
+        const sel = `#${CSS.escape(a.id)} ${parts.slice(-n).join(' > ')}`;
+        if (unique(root, sel, el)) return sel;
+      }
+      break;
+    }
+    return found;
   }
 
   /** One segment per shadow boundary crossed, outermost first. */
@@ -144,6 +180,7 @@
   /* ------------------------------- lifecycle ------------------------------- */
 
   function teardown() {
+    classWatch.disconnect();
     for (const [type, fn] of listeners) window.removeEventListener(type, fn, true);
     chrome.runtime.onMessage.removeListener(onMessage);
     host.remove();
@@ -169,6 +206,7 @@
     swallow(e);
     const el = current || e.composedPath()[0] || e.target;
     if (!el || el.nodeType !== 1) return;
+    noteClasses(classWatch.takeRecords()); // mutations from this very event are still queued
     const selector = pathTo(el).join(' >>> ');
     teardown();
     chrome.runtime.sendMessage({ type: 'picked', selector, desc: describe(el) });

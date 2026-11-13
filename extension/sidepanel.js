@@ -28,7 +28,6 @@ const state = {
   tabId: null,
   url: null,
   version: null,
-  evalOk: true,
   result: null,
   applied: false,
   picking: false,
@@ -57,28 +56,14 @@ const clearBanner = () => banner('');
 
 /* --------------------------------- chrome --------------------------------- */
 
-const NO_EVAL_WHY =
-  "This page's Content Security Policy forbids eval, so verify and Apply / Clear cannot run " +
-  'here — both need to execute the generated snippet. Analysis and the snippet itself work ' +
-  'normally; paste the snippet into this page’s DevTools console, which is exempt from the CSP.';
-
-/**
- * Reflect what the page allows. `evalOk === false` disables exactly the two
- * features that need to execute generated code, up front, with the reason
- * attached -- rather than letting the user click and collect an exception.
- */
-function setStatus(version, evalOk) {
+/** Reflect whether the library is present on the page. */
+function setStatus(version) {
   state.version = version || null;
-  state.evalOk = evalOk !== false;
   const badge = $('world');
   if (!version) {
     badge.textContent = 'not injected';
     badge.className = 'badge off';
     badge.title = 'The library is not present on this page.';
-  } else if (!state.evalOk) {
-    badge.textContent = 'eval blocked';
-    badge.className = 'badge limited';
-    badge.title = NO_EVAL_WHY;
   } else {
     badge.textContent = 'ready';
     badge.className = 'badge';
@@ -149,9 +134,7 @@ function syncButtons() {
   const usable = !!state.matches && state.matches > 0;
   $('analyze').disabled = !usable;
   $('flash').disabled = !usable;
-  const canRun = state.evalOk && !!(state.result && state.result.verifySnippet);
-  $('hover-toggle').disabled = !canRun;
-  $('hover-toggle').title = state.evalOk ? '' : NO_EVAL_WHY;
+  $('hover-toggle').disabled = !(state.result && state.result.plan);
 }
 
 /* -------------------------------- rendering -------------------------------- */
@@ -362,8 +345,7 @@ function renderSnippet(r) {
       h('h3', { class: 'grow', text: `Hover snippet — ${r.snippet.length} chars` }),
       copy
     ),
-    h('pre', { class: 'snippet', text: r.snippet }),
-    state.evalOk ? null : h('p', { class: 'note warn', text: NO_EVAL_WHY })
+    h('pre', { class: 'snippet', text: r.snippet })
   );
 }
 
@@ -410,16 +392,12 @@ async function analyze() {
       state.result = null;
       render();
       banner(
-        r.restricted
-          ? 'Chrome does not allow extensions to run on this page.'
-          : r.cspBlocked
-            ? `${r.error} — ${NO_EVAL_WHY}`
-            : r.error || 'Analysis failed.'
+        r.restricted ? 'Chrome does not allow extensions to run on this page.' : r.error || 'Analysis failed.'
       );
       return;
     }
     state.result = r;
-    if (r.version) setStatus(r.version, state.evalOk);
+    if (r.version) setStatus(r.version);
     // A fresh analysis invalidates whatever the previous snippet applied.
     state.applied = false;
     render();
@@ -431,18 +409,18 @@ async function analyze() {
 }
 
 async function apply() {
-  const code = state.result && state.result.verifySnippet;
-  if (!code) return;
+  const plan = state.result && state.result.plan;
+  if (!plan) return;
   clearBanner();
-  const r = await send({ type: 'apply', code });
-  if (!r.ok) return banner(r.cspBlocked ? NO_EVAL_WHY : r.error || 'Could not apply the hover state.');
+  const r = await send({ type: 'apply', plan });
+  if (!r.ok) return banner(r.error || 'Could not apply the hover state.');
   setApplied(true);
 }
 
 async function clearHover() {
   clearBanner();
   const r = await send({ type: 'clear' });
-  if (!r.ok) return banner(r.cspBlocked ? NO_EVAL_WHY : r.error || 'Could not clear the hover state.');
+  if (!r.ok) return banner(r.error || 'Could not clear the hover state.');
   setApplied(false);
 }
 
@@ -465,7 +443,7 @@ async function attach({ keepSelector = false } = {}) {
 
   const r = await send({ type: 'status' });
   if (!r.ok) {
-    setStatus(null, true);
+    setStatus(null);
     banner(
       r.restricted
         ? 'Chrome does not allow extensions to run on this page. Open a normal http(s) page.'
@@ -474,7 +452,7 @@ async function attach({ keepSelector = false } = {}) {
     $('analyze').disabled = true;
     return;
   }
-  setStatus(r.version, r.evalOk);
+  setStatus(r.version);
   probe();
 }
 
@@ -529,7 +507,7 @@ $('reinject').addEventListener('click', async () => {
   if (!r.ok) return banner(r.error || 'Re-injection failed.');
   state.result = null;
   state.applied = false;
-  setStatus(r.version, r.evalOk);
+  setStatus(r.version);
   render();
   setApplied(false);
 });
